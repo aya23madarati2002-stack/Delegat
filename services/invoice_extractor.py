@@ -2,37 +2,23 @@ import re
 
 from dateutil import parser
 
+from services.ml_document_classifier import classify_document, map_ml_type_to_extractor_type
+
 
 def extract_invoice_data(text: str) -> dict:
+    ml_result = classify_document(text)
+
     return {
-        "document_type": detect_document_type(text),
+        "document_type": map_ml_type_to_extractor_type(ml_result["predicted_type"]),
+        "ml_document_type": ml_result["predicted_type"],
+        "ml_confidence": ml_result["confidence"],
         "company_name": extract_company_name(text),
         "invoice_date": extract_date(text),
         "invoice_number": extract_invoice_number(text),
         "amount": extract_amount(text),
         "provider": extract_provider(text),
-        "confidence": estimate_confidence(text),
+        "confidence": estimate_confidence(text, ml_result),
     }
-
-
-def detect_document_type(text: str) -> str:
-    lowered = text.lower()
-
-    keywords = [
-        "rechnung",
-        "invoice",
-        "utility",
-        "verbrauch",
-        "strom",
-        "gas",
-        "energie",
-        "energy",
-    ]
-
-    if any(keyword in lowered for keyword in keywords):
-        return "utility_invoice"
-
-    return "unknown"
 
 
 def extract_company_name(text: str) -> str | None:
@@ -43,6 +29,7 @@ def extract_company_name(text: str) -> str | None:
 
     for pattern in specific_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
+
         if match:
             return clean(match.group(1))
 
@@ -56,6 +43,7 @@ def extract_company_name(text: str) -> str | None:
 
     for pattern in generic_patterns:
         match = re.search(pattern, text)
+
         if match:
             return clean(match.group(1))
 
@@ -70,6 +58,7 @@ def extract_date(text: str) -> str | None:
 
     for pattern in labelled_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
+
         if match:
             return parse_date(match.group(1))
 
@@ -81,6 +70,7 @@ def extract_date(text: str) -> str | None:
 
     for pattern in fallback_patterns:
         match = re.search(pattern, text)
+
         if match:
             return parse_date(match.group(0))
 
@@ -104,6 +94,7 @@ def extract_invoice_number(text: str) -> str | None:
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
+
         if match:
             return clean(match.group(1))
 
@@ -121,6 +112,7 @@ def extract_amount(text: str) -> str | None:
 
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
+
         if match:
             value = match.group(1) if match.lastindex else match.group(0)
             return clean(value)
@@ -136,6 +128,7 @@ def extract_provider(text: str) -> str | None:
         "Iberdrola",
         "Octopus Energy",
         "TotalEnergies",
+        "Berliner Wasserbetriebe",
     ]
 
     for provider in providers:
@@ -145,11 +138,14 @@ def extract_provider(text: str) -> str | None:
     return None
 
 
-def estimate_confidence(text: str) -> int:
-    score = 30
+def estimate_confidence(text: str, ml_result: dict) -> int:
+    score = 20
 
-    if detect_document_type(text) != "unknown":
-        score += 20
+    if ml_result["predicted_type"] == "utility_bill":
+        score += 25
+
+    if ml_result["confidence"] >= 50:
+        score += 15
 
     if extract_company_name(text):
         score += 20

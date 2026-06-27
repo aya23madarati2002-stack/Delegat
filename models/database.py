@@ -45,6 +45,8 @@ def init_db() -> None:
                 document_id INTEGER NOT NULL,
                 raw_text_preview TEXT,
                 document_type_detected TEXT,
+                ml_document_type TEXT,
+                ml_confidence INTEGER,
                 company_name TEXT,
                 invoice_date TEXT,
                 invoice_number TEXT,

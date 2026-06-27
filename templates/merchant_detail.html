@@ -66,12 +66,14 @@
 
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
         <p><span class="text-gray-500">Document Type:</span> {{ merchant.last_invoice.document_type_detected }}</p>
+        <p><span class="text-gray-500">ML Type:</span> {{ merchant.last_invoice.ml_document_type or "not detected" }}</p>
+        <p><span class="text-gray-500">ML Confidence:</span> {{ merchant.last_invoice.ml_confidence or 0 }}%</p>
         <p><span class="text-gray-500">Company:</span> {{ merchant.last_invoice.company_name or "not detected" }}</p>
         <p><span class="text-gray-500">Invoice Date:</span> {{ merchant.last_invoice.invoice_date or "not detected" }}</p>
         <p><span class="text-gray-500">Invoice Number:</span> {{ merchant.last_invoice.invoice_number or "not detected" }}</p>
         <p><span class="text-gray-500">Amount:</span> {{ merchant.last_invoice.amount or "not detected" }}</p>
         <p><span class="text-gray-500">Provider:</span> {{ merchant.last_invoice.provider or "not detected" }}</p>
-        <p><span class="text-gray-500">Confidence:</span> {{ merchant.last_invoice.confidence }}%</p>
+        <p><span class="text-gray-500">Overall Confidence:</span> {{ merchant.last_invoice.confidence }}%</p>
     </div>
 </div>
 

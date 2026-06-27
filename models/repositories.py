@@ -283,6 +283,8 @@ def save_extraction_and_validation(
                     document_id,
                     raw_text_preview,
                     document_type_detected,
+                    ml_document_type,
+                    ml_confidence,
                     company_name,
                     invoice_date,
                     invoice_number,
@@ -291,13 +293,15 @@ def save_extraction_and_validation(
                     confidence
                 )
             VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 merchant_id,
                 document_id,
                 raw_text[:1200],
                 invoice.get("document_type"),
+                invoice.get("ml_document_type"),
+                invoice.get("ml_confidence"),
                 invoice.get("company_name"),
                 invoice.get("invoice_date"),
                 invoice.get("invoice_number"),
