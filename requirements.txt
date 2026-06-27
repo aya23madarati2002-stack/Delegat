@@ -2,3 +2,4 @@ flask
 pymupdf
 python-dateutil
 docling
+scikit-learn

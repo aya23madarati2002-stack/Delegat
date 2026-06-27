@@ -6,15 +6,19 @@ from config import DATABASE_PATH, INSTANCE_FOLDER
 def get_connection() -> sqlite3.Connection:
     INSTANCE_FOLDER.mkdir(exist_ok=True)
 
-    connection = sqlite3.connect(DATABASE_PATH)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
+
     connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 30000")
 
     return connection
 
 
 def init_db() -> None:
     with get_connection() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS merchants (
@@ -29,28 +33,45 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE TABLE IF NOT EXISTS documents (
+            CREATE TABLE IF NOT EXISTS document_requirements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 merchant_id INTEGER NOT NULL,
-                document_type TEXT NOT NULL,
-                filename TEXT,
-                status TEXT NOT NULL,
-                uploaded_at TEXT,
+                requirement_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'missing',
+                required INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL DEFAULT 'system',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (merchant_id, requirement_type),
                 FOREIGN KEY (merchant_id) REFERENCES merchants(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS invoice_extractions (
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                merchant_id INTEGER NOT NULL,
+                requirement_id INTEGER,
+                original_filename TEXT,
+                stored_filename TEXT,
+                document_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                ml_document_type TEXT,
+                ml_confidence INTEGER,
+                uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id) ON DELETE CASCADE,
+                FOREIGN KEY (requirement_id) REFERENCES document_requirements(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS document_extractions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 merchant_id INTEGER NOT NULL,
                 document_id INTEGER NOT NULL,
                 raw_text_preview TEXT,
                 document_type_detected TEXT,
-                company_name TEXT,
-                invoice_date TEXT,
-                invoice_number TEXT,
-                amount TEXT,
-                provider TEXT,
-                confidence INTEGER,
+                document_label TEXT,
+                classification_confidence INTEGER,
+                extracted_fields_json TEXT,
+                validation_label TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (merchant_id) REFERENCES merchants(id) ON DELETE CASCADE,
                 FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
@@ -62,7 +83,7 @@ def init_db() -> None:
                 field TEXT NOT NULL,
                 status TEXT NOT NULL,
                 message TEXT NOT NULL,
-                FOREIGN KEY (extraction_id) REFERENCES invoice_extractions(id) ON DELETE CASCADE
+                FOREIGN KEY (extraction_id) REFERENCES document_extractions(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS agent_messages (

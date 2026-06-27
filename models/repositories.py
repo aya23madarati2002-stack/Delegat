@@ -1,4 +1,16 @@
+import json
+from sqlite3 import Connection
+
 from models.database import get_connection, row_to_dict
+from services.case_generator import build_missing_documents_message, get_requirement_label
+
+
+REQUIRED_REQUIREMENTS = [
+    "commercial_register",
+    "passport",
+    "utility_bill",
+    "bank_statement",
+]
 
 
 def seed_demo_data() -> None:
@@ -25,31 +37,29 @@ def seed_demo_data() -> None:
                 "Jan Becker",
                 "jan.becker@techpay.de",
                 "Waiting for Documents",
-                75,
+                0,
             ),
         )
 
         merchant_id = cursor.lastrowid
 
-        documents = [
-            ("Handelsregister", None, "valid"),
-            ("Passport", None, "valid"),
-            ("Utility Bill", None, "missing"),
-            ("Bank Statement", None, "valid"),
-        ]
-
-        connection.executemany(
-            """
-            INSERT INTO documents
-                (merchant_id, document_type, filename, status)
-            VALUES
-                (?, ?, ?, ?)
-            """,
-            [
-                (merchant_id, document_type, filename, status)
-                for document_type, filename, status in documents
-            ],
-        )
+        for requirement_type in REQUIRED_REQUIREMENTS:
+            connection.execute(
+                """
+                INSERT INTO document_requirements
+                    (merchant_id, requirement_type, label, status, required, created_by)
+                VALUES
+                    (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    merchant_id,
+                    requirement_type,
+                    get_requirement_label(requirement_type),
+                    "missing",
+                    1,
+                    "system",
+                ),
+            )
 
         connection.execute(
             """
@@ -60,7 +70,7 @@ def seed_demo_data() -> None:
             """,
             (
                 merchant_id,
-                "Please upload a recent Utility Bill. It must show company name, date, address and provider.",
+                "Please upload the required KYC documents. Delegat will classify and group them automatically.",
             ),
         )
 
@@ -81,15 +91,16 @@ def seed_demo_data() -> None:
             VALUES
                 (?, ?, ?, ?)
             """,
-            (merchant_id, "AI", "document_request", "Requested missing Utility Bill."),
+            (merchant_id, "AI", "document_request", "Requested all required KYC document groups."),
         )
 
 
 def reset_demo_data() -> None:
     with get_connection() as connection:
         connection.execute("DELETE FROM validation_checks")
-        connection.execute("DELETE FROM invoice_extractions")
+        connection.execute("DELETE FROM document_extractions")
         connection.execute("DELETE FROM documents")
+        connection.execute("DELETE FROM document_requirements")
         connection.execute("DELETE FROM agent_messages")
         connection.execute("DELETE FROM audit_log")
         connection.execute("DELETE FROM merchants")
@@ -143,65 +154,122 @@ def get_merchant_detail(merchant_id: int) -> dict | None:
             ).fetchone()
         )
 
-        if not merchant:
-            return None
+    if not merchant:
+        return None
 
-        merchant["documents"] = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT *
-                FROM documents
-                WHERE merchant_id = ?
-                ORDER BY id
-                """,
-                (merchant_id,),
-            ).fetchall()
-        ]
+    merchant["requirements"] = get_requirements_for_merchant(merchant_id)
+    merchant["documents"] = get_documents_for_merchant(merchant_id)
+    merchant["agent_messages"] = get_agent_messages_for_merchant(merchant_id)
+    merchant["last_document"] = get_last_document_extraction_for_merchant(merchant_id)
+    merchant["last_validation"] = None
 
-        merchant["agent_messages"] = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT *
-                FROM agent_messages
-                WHERE merchant_id = ?
-                ORDER BY id
-                """,
-                (merchant_id,),
-            ).fetchall()
-        ]
+    if merchant["last_document"]:
+        checks = get_validation_checks_for_extraction(merchant["last_document"]["extraction_id"])
 
-        merchant["audit_log"] = [
-            dict(row)
-            for row in connection.execute(
-                """
-                SELECT *
-                FROM audit_log
-                WHERE merchant_id = ?
-                ORDER BY id DESC
-                """,
-                (merchant_id,),
-            ).fetchall()
-        ]
+        merchant["last_validation"] = {
+            "status": infer_validation_status(checks),
+            "label": infer_validation_label(checks),
+            "checks": checks,
+        }
 
-        last_extraction = row_to_dict(
+    return merchant
+
+
+def get_requirement_case_detail(merchant_id: int, requirement_id: int) -> dict | None:
+    merchant = get_merchant_detail(merchant_id)
+
+    if not merchant:
+        return None
+
+    with get_connection() as connection:
+        requirement = row_to_dict(
             connection.execute(
                 """
                 SELECT *
-                FROM invoice_extractions
-                WHERE merchant_id = ?
-                ORDER BY id DESC
-                LIMIT 1
+                FROM document_requirements
+                WHERE id = ? AND merchant_id = ?
                 """,
-                (merchant_id,),
+                (requirement_id, merchant_id),
             ).fetchone()
         )
 
-        merchant["last_invoice"] = last_extraction
-        merchant["last_validation"] = None
+        if not requirement:
+            return None
 
-        if last_extraction:
+        documents = [
+            parse_extracted_fields(dict(row))
+            for row in connection.execute(
+                """
+                SELECT
+                    d.*,
+                    e.id AS extraction_id,
+                    e.document_type_detected,
+                    e.document_label,
+                    e.classification_confidence,
+                    e.extracted_fields_json,
+                    e.validation_label,
+                    e.raw_text_preview
+                FROM documents d
+                LEFT JOIN document_extractions e
+                    ON e.document_id = d.id
+                WHERE d.requirement_id = ?
+                ORDER BY d.uploaded_at DESC, d.id DESC
+                """,
+                (requirement_id,),
+            ).fetchall()
+        ]
+
+    requirement["documents"] = documents
+
+    return {
+        "merchant": merchant,
+        "requirement": requirement,
+    }
+
+
+def get_audit_page_data(merchant_id: int) -> dict | None:
+    merchant = get_merchant_detail(merchant_id)
+
+    if not merchant:
+        return None
+
+    merchant["audit_log"] = get_audit_log_for_merchant(merchant_id)
+
+    return merchant
+
+
+def get_document_detail(merchant_id: int, document_id: int) -> dict | None:
+    with get_connection() as connection:
+        document = row_to_dict(
+            connection.execute(
+                """
+                SELECT
+                    d.*,
+                    r.label AS requirement_label,
+                    r.requirement_type,
+                    e.id AS extraction_id,
+                    e.document_type_detected,
+                    e.document_label,
+                    e.classification_confidence,
+                    e.extracted_fields_json,
+                    e.validation_label,
+                    e.raw_text_preview
+                FROM documents d
+                LEFT JOIN document_requirements r
+                    ON r.id = d.requirement_id
+                LEFT JOIN document_extractions e
+                    ON e.document_id = d.id
+                WHERE d.id = ? AND d.merchant_id = ?
+                """,
+                (document_id, merchant_id),
+            ).fetchone()
+        )
+
+        if not document:
+            return None
+
+        checks = []
+        if document.get("extraction_id"):
             checks = [
                 dict(row)
                 for row in connection.execute(
@@ -211,57 +279,224 @@ def get_merchant_detail(merchant_id: int) -> dict | None:
                     WHERE extraction_id = ?
                     ORDER BY id
                     """,
-                    (last_extraction["id"],),
+                    (document["extraction_id"],),
                 ).fetchall()
             ]
 
-            merchant["last_validation"] = {
-                "status": infer_validation_status(checks),
-                "label": infer_validation_label(checks),
-                "checks": checks,
-            }
+    document = parse_extracted_fields(document)
+    document["validation_checks"] = checks
 
-    return merchant
+    merchant = get_merchant_detail(merchant_id)
+
+    return {
+        "merchant": merchant,
+        "document": document,
+    }
 
 
-def create_or_update_uploaded_document(
+def get_document_file(document_id: int) -> dict | None:
+    with get_connection() as connection:
+        document = row_to_dict(
+            connection.execute(
+                """
+                SELECT id, original_filename, stored_filename
+                FROM documents
+                WHERE id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+        )
+
+    return document
+
+
+def get_requirements_for_merchant(merchant_id: int) -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                r.*,
+                COUNT(d.id) AS document_count,
+                MAX(d.ml_confidence) AS best_ml_confidence
+            FROM document_requirements r
+            LEFT JOIN documents d
+                ON d.requirement_id = r.id
+            WHERE r.merchant_id = ?
+            GROUP BY r.id
+            ORDER BY
+                CASE r.status
+                    WHEN 'missing' THEN 1
+                    WHEN 'review' THEN 2
+                    WHEN 'valid' THEN 3
+                    ELSE 4
+                END,
+                r.label
+            """,
+            (merchant_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_documents_for_merchant(merchant_id: int) -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                d.*,
+                r.label AS requirement_label,
+                r.requirement_type
+            FROM documents d
+            LEFT JOIN document_requirements r
+                ON r.id = d.requirement_id
+            WHERE d.merchant_id = ?
+            ORDER BY d.uploaded_at DESC, d.id DESC
+            """,
+            (merchant_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_agent_messages_for_merchant(merchant_id: int) -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM agent_messages
+            WHERE merchant_id = ?
+            ORDER BY id
+            """,
+            (merchant_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_audit_log_for_merchant(merchant_id: int) -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM audit_log
+            WHERE merchant_id = ?
+            ORDER BY id DESC
+            """,
+            (merchant_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_last_document_extraction_for_merchant(merchant_id: int) -> dict | None:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                e.id AS extraction_id,
+                e.*,
+                d.original_filename
+            FROM document_extractions e
+            JOIN documents d
+                ON d.id = e.document_id
+            WHERE e.merchant_id = ?
+            ORDER BY e.id DESC
+            LIMIT 1
+            """,
+            (merchant_id,),
+        ).fetchone()
+
+    if not row:
+        return None
+
+    return parse_extracted_fields(dict(row))
+
+
+def get_validation_checks_for_extraction(extraction_id: int) -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM validation_checks
+            WHERE extraction_id = ?
+            ORDER BY id
+            """,
+            (extraction_id,),
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_or_create_requirement(
     merchant_id: int,
-    document_type: str,
-    filename: str,
+    requirement_type: str,
+    label: str,
+    created_by: str,
 ) -> int:
     with get_connection() as connection:
         existing = connection.execute(
             """
             SELECT id
-            FROM documents
-            WHERE merchant_id = ? AND document_type = ?
+            FROM document_requirements
+            WHERE merchant_id = ? AND requirement_type = ?
             LIMIT 1
             """,
-            (merchant_id, document_type),
+            (merchant_id, requirement_type),
         ).fetchone()
 
         if existing:
-            document_id = existing["id"]
-
-            connection.execute(
-                """
-                UPDATE documents
-                SET filename = ?, status = ?, uploaded_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (filename, "processing", document_id),
-            )
-
-            return document_id
+            return existing["id"]
 
         cursor = connection.execute(
             """
-            INSERT INTO documents
-                (merchant_id, document_type, filename, status, uploaded_at)
+            INSERT INTO document_requirements
+                (merchant_id, requirement_type, label, status, required, created_by)
             VALUES
-                (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                (?, ?, ?, ?, ?, ?)
             """,
-            (merchant_id, document_type, filename, "processing"),
+            (merchant_id, requirement_type, label, "review", 0, created_by),
+        )
+
+        return cursor.lastrowid
+
+
+def create_uploaded_document(
+    merchant_id: int,
+    requirement_id: int,
+    original_filename: str,
+    stored_filename: str,
+    document_type: str,
+    status: str,
+    ml_document_type: str | None,
+    ml_confidence: int | None,
+) -> int:
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO documents
+                (
+                    merchant_id,
+                    requirement_id,
+                    original_filename,
+                    stored_filename,
+                    document_type,
+                    status,
+                    ml_document_type,
+                    ml_confidence
+                )
+            VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                merchant_id,
+                requirement_id,
+                original_filename,
+                stored_filename,
+                document_type,
+                status,
+                ml_document_type,
+                ml_confidence,
+            ),
         )
 
         return cursor.lastrowid
@@ -270,40 +505,37 @@ def create_or_update_uploaded_document(
 def save_extraction_and_validation(
     merchant_id: int,
     document_id: int,
+    requirement_id: int,
     raw_text: str,
-    invoice: dict,
+    extraction: dict,
     validation: dict,
 ) -> int:
     with get_connection() as connection:
         cursor = connection.execute(
             """
-            INSERT INTO invoice_extractions
+            INSERT INTO document_extractions
                 (
                     merchant_id,
                     document_id,
                     raw_text_preview,
                     document_type_detected,
-                    company_name,
-                    invoice_date,
-                    invoice_number,
-                    amount,
-                    provider,
-                    confidence
+                    document_label,
+                    classification_confidence,
+                    extracted_fields_json,
+                    validation_label
                 )
             VALUES
-                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 merchant_id,
                 document_id,
                 raw_text[:1200],
-                invoice.get("document_type"),
-                invoice.get("company_name"),
-                invoice.get("invoice_date"),
-                invoice.get("invoice_number"),
-                invoice.get("amount"),
-                invoice.get("provider"),
-                invoice.get("confidence"),
+                extraction.get("document_type"),
+                extraction.get("document_label"),
+                extraction.get("classification_confidence"),
+                json.dumps(extraction.get("extracted_fields", {}), ensure_ascii=False),
+                validation.get("label"),
             ),
         )
 
@@ -327,31 +559,111 @@ def save_extraction_and_validation(
             ],
         )
 
-        document_status = map_validation_status_to_document_status(validation["status"])
-
-        connection.execute(
-            """
-            UPDATE documents
-            SET status = ?
-            WHERE id = ?
-            """,
-            (document_status, document_id),
-        )
-
-        merchant_status, progress = map_validation_status_to_merchant_status(
-            validation["status"]
-        )
-
-        connection.execute(
-            """
-            UPDATE merchants
-            SET status = ?, progress = ?
-            WHERE id = ?
-            """,
-            (merchant_status, progress, merchant_id),
-        )
+        update_requirement_status_with_connection(connection, requirement_id)
+        update_merchant_status_with_connection(connection, merchant_id)
 
         return extraction_id
+
+
+def update_requirement_status_with_connection(
+    connection: Connection,
+    requirement_id: int,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT status
+        FROM documents
+        WHERE requirement_id = ?
+        """,
+        (requirement_id,),
+    ).fetchall()
+
+    statuses = [row["status"] for row in rows]
+
+    if not statuses:
+        new_status = "missing"
+    elif "valid" in statuses:
+        new_status = "valid"
+    elif "review" in statuses or "rejected" in statuses:
+        new_status = "review"
+    else:
+        new_status = "missing"
+
+    connection.execute(
+        """
+        UPDATE document_requirements
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (new_status, requirement_id),
+    )
+
+
+def update_merchant_status_with_connection(
+    connection: Connection,
+    merchant_id: int,
+) -> None:
+    rows = connection.execute(
+        """
+        SELECT status
+        FROM document_requirements
+        WHERE merchant_id = ? AND required = 1
+        """,
+        (merchant_id,),
+    ).fetchall()
+
+    statuses = [row["status"] for row in rows]
+
+    if not statuses:
+        merchant_status = "Waiting for Documents"
+        progress = 0
+    else:
+        valid_count = statuses.count("valid")
+        review_count = statuses.count("review")
+        total_count = len(statuses)
+
+        progress = round(((valid_count + review_count * 0.5) / total_count) * 100)
+
+        if valid_count == total_count:
+            merchant_status = "Ready for Human Risk Review"
+        elif review_count > 0:
+            merchant_status = "Needs Review"
+        else:
+            merchant_status = "Waiting for Documents"
+
+    connection.execute(
+        """
+        UPDATE merchants
+        SET status = ?, progress = ?
+        WHERE id = ?
+        """,
+        (merchant_status, progress, merchant_id),
+    )
+
+
+def update_missing_document_request(merchant_id: int) -> None:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT label
+            FROM document_requirements
+            WHERE merchant_id = ? AND required = 1 AND status = 'missing'
+            ORDER BY label
+            """,
+            (merchant_id,),
+        ).fetchall()
+
+    missing_labels = [row["label"] for row in rows]
+    message = build_missing_documents_message(missing_labels)
+
+    add_agent_message(merchant_id, message)
+
+    add_audit_log(
+        merchant_id,
+        "AI",
+        "missing_documents_checked",
+        message,
+    )
 
 
 def add_agent_message(merchant_id: int, message: str) -> None:
@@ -385,22 +697,18 @@ def add_audit_log(
         )
 
 
-def map_validation_status_to_document_status(validation_status: str) -> str:
-    return {
-        "green": "valid",
-        "yellow": "review",
-        "red": "missing",
-    }[validation_status]
+def parse_extracted_fields(row: dict) -> dict:
+    raw_json = row.get("extracted_fields_json")
 
+    if raw_json:
+        try:
+            row["extracted_fields"] = json.loads(raw_json)
+        except json.JSONDecodeError:
+            row["extracted_fields"] = {}
+    else:
+        row["extracted_fields"] = {}
 
-def map_validation_status_to_merchant_status(validation_status: str) -> tuple[str, int]:
-    if validation_status == "green":
-        return "Ready for Human Risk Review", 95
-
-    if validation_status == "yellow":
-        return "Needs Review", 85
-
-    return "Human Review Required", 75
+    return row
 
 
 def infer_validation_status(checks: list[dict]) -> str:

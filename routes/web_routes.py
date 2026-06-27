@@ -1,22 +1,18 @@
-from uuid import uuid4
-
-from flask import Blueprint, current_app, redirect, render_template, request, url_for
-from werkzeug.utils import secure_filename
+from flask import Blueprint, current_app, redirect, render_template, request, send_from_directory, url_for
 
 from config import ALLOWED_EXTENSIONS
 from models.repositories import (
     add_agent_message,
     add_audit_log,
-    create_or_update_uploaded_document,
+    get_audit_page_data,
     get_dashboard_data,
+    get_document_detail,
+    get_document_file,
     get_merchant_detail,
+    get_requirement_case_detail,
     reset_demo_data,
-    save_extraction_and_validation,
 )
-from services.agent_service import build_agent_comment
-from services.document_reader import read_document
-from services.invoice_extractor import extract_invoice_data
-from services.kyc_validator import validate_invoice
+from services.batch_processor import process_batch_upload
 
 web_bp = Blueprint("web", __name__)
 
@@ -42,6 +38,94 @@ def merchant_detail(merchant_id: int):
     return render_template("merchant_detail.html", merchant=merchant)
 
 
+@web_bp.route("/merchant/<int:merchant_id>/case/<int:requirement_id>")
+def requirement_case_detail(merchant_id: int, requirement_id: int):
+    case_data = get_requirement_case_detail(
+        merchant_id=merchant_id,
+        requirement_id=requirement_id,
+    )
+
+    if not case_data:
+        return "Case not found", 404
+
+    return render_template(
+        "case_detail.html",
+        merchant=case_data["merchant"],
+        requirement=case_data["requirement"],
+    )
+
+
+@web_bp.route("/merchant/<int:merchant_id>/document/<int:document_id>")
+def document_detail(merchant_id: int, document_id: int):
+    detail = get_document_detail(
+        merchant_id=merchant_id,
+        document_id=document_id,
+    )
+
+    if not detail:
+        return "Document not found", 404
+
+    return render_template(
+        "document_detail.html",
+        merchant=detail["merchant"],
+        document=detail["document"],
+    )
+
+
+@web_bp.route("/document/<int:document_id>/view")
+def view_document_file(document_id: int):
+    document = get_document_file(document_id)
+
+    if not document:
+        return "Document not found", 404
+
+    return send_from_directory(
+        current_app.config["UPLOAD_FOLDER"],
+        document["stored_filename"],
+        as_attachment=False,
+        download_name=document["original_filename"],
+    )
+
+
+@web_bp.route("/merchant/<int:merchant_id>/audit")
+def audit_log(merchant_id: int):
+    merchant = get_audit_page_data(merchant_id)
+
+    if not merchant:
+        return "Merchant not found", 404
+
+    return render_template("audit_log.html", merchant=merchant)
+
+
+@web_bp.route("/merchant/<int:merchant_id>/batch")
+def batch_upload_page(merchant_id: int):
+    merchant = get_merchant_detail(merchant_id)
+
+    if not merchant:
+        return "Merchant not found", 404
+
+    return render_template("batch_upload.html", merchant=merchant)
+
+
+@web_bp.route("/merchant/<int:merchant_id>/batch-upload", methods=["POST"])
+def batch_upload(merchant_id: int):
+    merchant = get_merchant_detail(merchant_id)
+
+    if not merchant:
+        return "Merchant not found", 404
+
+    uploaded_files = request.files.getlist("documents")
+
+    process_batch_upload(
+        merchant=merchant,
+        uploaded_files=uploaded_files,
+        upload_folder=current_app.config["UPLOAD_FOLDER"],
+        allowed_file_callback=allowed_file,
+    )
+
+    return redirect(url_for("web.merchant_detail", merchant_id=merchant_id))
+
+
 @web_bp.route("/merchant/<int:merchant_id>/upload", methods=["POST"])
 def upload_document(merchant_id: int):
     merchant = get_merchant_detail(merchant_id)
@@ -61,88 +145,12 @@ def upload_document(merchant_id: int):
         )
         return redirect(url_for("web.merchant_detail", merchant_id=merchant_id))
 
-    if not allowed_file(uploaded_file.filename):
-        add_agent_message(
-            merchant_id,
-            "Unsupported file type. Please upload PDF, PNG, JPG, JPEG or TXT.",
-        )
-        add_audit_log(
-            merchant_id,
-            "System",
-            "upload_failed",
-            f"Unsupported file type: {uploaded_file.filename}",
-        )
-        return redirect(url_for("web.merchant_detail", merchant_id=merchant_id))
-
-    original_filename = secure_filename(uploaded_file.filename)
-    stored_filename = f"{uuid4().hex}_{original_filename}"
-    file_path = current_app.config["UPLOAD_FOLDER"] / stored_filename
-
-    uploaded_file.save(file_path)
-
-    document_id = create_or_update_uploaded_document(
-        merchant_id=merchant_id,
-        document_type="Utility Bill",
-        filename=stored_filename,
+    process_batch_upload(
+        merchant=merchant,
+        uploaded_files=[uploaded_file],
+        upload_folder=current_app.config["UPLOAD_FOLDER"],
+        allowed_file_callback=allowed_file,
     )
-
-    add_audit_log(
-        merchant_id,
-        "Merchant",
-        "document_uploaded",
-        f"Uploaded document: {original_filename}",
-    )
-
-    try:
-        raw_text = read_document(str(file_path))
-
-        add_audit_log(
-            merchant_id,
-            "AI",
-            "document_read",
-            "Document text was extracted successfully.",
-        )
-
-        invoice = extract_invoice_data(raw_text)
-
-        add_audit_log(
-            merchant_id,
-            "AI",
-            "invoice_extracted",
-            "Invoice fields were extracted from the document.",
-        )
-
-        validation = validate_invoice(invoice, expected_company=merchant["name"])
-
-        save_extraction_and_validation(
-            merchant_id=merchant_id,
-            document_id=document_id,
-            raw_text=raw_text,
-            invoice=invoice,
-            validation=validation,
-        )
-
-        add_agent_message(merchant_id, build_agent_comment(validation))
-
-        add_audit_log(
-            merchant_id,
-            "AI",
-            "validation_completed",
-            f"Validation completed: {validation['label']}",
-        )
-
-    except Exception as exc:
-        add_agent_message(
-            merchant_id,
-            f"The document could not be processed automatically: {exc}",
-        )
-
-        add_audit_log(
-            merchant_id,
-            "System",
-            "processing_error",
-            f"Document processing failed: {exc}",
-        )
 
     return redirect(url_for("web.merchant_detail", merchant_id=merchant_id))
 
